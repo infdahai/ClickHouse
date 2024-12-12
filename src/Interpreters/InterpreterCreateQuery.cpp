@@ -1188,6 +1188,22 @@ namespace
         source_ast->children.push_back(source_ast->elements);
         dict.set(dict.source, source_ast);
     }
+
+    ASTs * getEngineArgsFromCreateQuery(ASTCreateQuery & create_query)
+    {
+        ASTStorage * storage_def = create_query.storage;
+        if (!storage_def)
+            return nullptr;
+
+        if (!storage_def->engine)
+            return nullptr;
+
+        const ASTFunction & engine_def = *storage_def->engine;
+        if (!engine_def.arguments)
+            return nullptr;
+
+        return &engine_def.arguments->children;
+    }
 }
 
 void InterpreterCreateQuery::setEngine(ASTCreateQuery & create) const
@@ -1445,8 +1461,8 @@ void addTableDependencies(const ASTCreateQuery & create, const ASTPtr & query_pt
 void checkTableCanBeAddedWithNoCyclicDependencies(const ASTCreateQuery & create, const ASTPtr & query_ptr, const ContextPtr & context)
 {
     QualifiedTableName qualified_name{create.getDatabase(), create.getTable()};
-    auto ref_dependencies = getDependenciesFromCreateQuery(context->getGlobalContext(), qualified_name, query_ptr, context->getCurrentDatabase());
-    auto loading_dependencies = getLoadingDependenciesFromCreateQuery(context->getGlobalContext(), qualified_name, query_ptr);
+    auto ref_dependencies = getDependenciesFromCreateQuery(context->getGlobalContext(), qualified_name, query_ptr, context->getCurrentDatabase(), /*can_throw*/true);
+    auto loading_dependencies = getLoadingDependenciesFromCreateQuery(context->getGlobalContext(), qualified_name, query_ptr, /*can_throw*/ true);
     DatabaseCatalog::instance().checkTableCanBeAddedWithNoCyclicDependencies(qualified_name, ref_dependencies, loading_dependencies);
 }
 
@@ -1633,29 +1649,29 @@ BlockIO InterpreterCreateQuery::createTable(ASTCreateQuery & create)
             if (isReplicated(*inner_table_engine))
                 is_storage_replicated = true;
         }
-        }
+    }
 
-        bool allow_heavy_populate = getContext()->getSettingsRef()[Setting::database_replicated_allow_heavy_create] && create.is_populate;
-        if (!allow_heavy_populate && database && database->getEngineName() == "Replicated" && (create.select || create.is_populate))
+    bool allow_heavy_populate = getContext()->getSettingsRef()[Setting::database_replicated_allow_heavy_create] && create.is_populate;
+    if (!allow_heavy_populate && database && database->getEngineName() == "Replicated" && (create.select || create.is_populate))
+    {
+        const bool allow_create_select_for_replicated
+            = (create.isView() && !create.is_populate) || create.is_create_empty || !is_storage_replicated;
+        if (!allow_create_select_for_replicated)
         {
-            const bool allow_create_select_for_replicated
-                = (create.isView() && !create.is_populate) || create.is_create_empty || !is_storage_replicated;
-            if (!allow_create_select_for_replicated)
-            {
-                /// POPULATE can be enabled with setting, provide hint in error message
-                if (create.is_populate)
-                    throw Exception(
-                        ErrorCodes::SUPPORT_IS_DISABLED,
-                        "CREATE with POPULATE is not supported with Replicated databases. Consider using separate CREATE and INSERT "
-                        "queries. "
-                        "Alternatively, you can enable 'database_replicated_allow_heavy_create' setting to allow this operation, use with "
-                        "caution");
-
+            /// POPULATE can be enabled with setting, provide hint in error message
+            if (create.is_populate)
                 throw Exception(
                     ErrorCodes::SUPPORT_IS_DISABLED,
-                    "CREATE AS SELECT is not supported with Replicated databases. Consider using separate CREATE and INSERT queries.");
-            }
+                    "CREATE with POPULATE is not supported with Replicated databases. Consider using separate CREATE and INSERT "
+                    "queries. "
+                    "Alternatively, you can enable 'database_replicated_allow_heavy_create' setting to allow this operation, use with "
+                    "caution");
+
+            throw Exception(
+                ErrorCodes::SUPPORT_IS_DISABLED,
+                "CREATE AS SELECT is not supported with Replicated databases. Consider using separate CREATE and INSERT queries.");
         }
+    }
 
     if (create.is_clone_as)
     {
@@ -1884,12 +1900,16 @@ bool InterpreterCreateQuery::doCreateTable(ASTCreateQuery & create,
             mode);
 
         /// If schema wes inferred while storage creation, add columns description to create query.
-        addColumnsDescriptionToCreateQueryIfNecessary(query_ptr->as<ASTCreateQuery &>(), res);
+        auto & create_query = query_ptr->as<ASTCreateQuery &>();
+        addColumnsDescriptionToCreateQueryIfNecessary(create_query, res);
+        /// Add any inferred engine args if needed. For example, data format for engines File/S3/URL/etc
+        if (auto * engine_args = getEngineArgsFromCreateQuery(create_query))
+            res->addInferredEngineArgsToCreateQuery(*engine_args, getContext());
     }
 
     validateVirtualColumns(*res);
 
-    if (!res->supportsDynamicSubcolumnsDeprecated() && hasDynamicSubcolumns(res->getInMemoryMetadataPtr()->getColumns()) && mode <= LoadingStrictnessLevel::CREATE)
+    if (!res->supportsDynamicSubcolumnsDeprecated() && hasDynamicSubcolumnsDeprecated(res->getInMemoryMetadataPtr()->getColumns()) && mode <= LoadingStrictnessLevel::CREATE)
     {
         throw Exception(ErrorCodes::ILLEGAL_COLUMN,
             "Cannot create table with column of type Object, "
