@@ -1,5 +1,6 @@
 #include <Storages/buildQueryTreeForShard.h>
 
+#include <Analyzer/ArrayJoinNode.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
@@ -12,6 +13,7 @@
 #include <Analyzer/Utils.h>
 #include <Core/Settings.h>
 #include <DataTypes/DataTypeString.h>
+#include <DataTypes/DataTypesNumber.h>
 #include <Functions/FunctionFactory.h>
 #include <Interpreters/DatabaseCatalog.h>
 #include <Interpreters/InterpreterSelectQueryAnalyzer.h>
@@ -490,6 +492,59 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
         auto columns_it = column_source_to_columns.find(join_table_expression);
         const NamesAndTypes & columns = columns_it != column_source_to_columns.end() ? columns_it->second.columns : NamesAndTypes();
         subquery_node = buildSubqueryToReadColumnsFromTableExpression(columns, join_table_expression, context);
+    }
+    else if (join_table_expression_node_type == QueryTreeNodeType::ARRAY_JOIN)
+    {
+        /// For ARRAY JOIN nodes, collect columns from all column sources in the subtree
+        /// (the ARRAY JOIN itself and its inner table expression), preserving correct column sources.
+        QueryTreeNodes subquery_projection_nodes;
+        NamesAndTypes projection_columns;
+        NameSet seen_column_names;
+
+        std::stack<QueryTreeNodePtr> nodes_to_visit;
+        nodes_to_visit.push(join_table_expression);
+        while (!nodes_to_visit.empty())
+        {
+            auto current = nodes_to_visit.top();
+            nodes_to_visit.pop();
+
+            auto columns_it = column_source_to_columns.find(current);
+            if (columns_it != column_source_to_columns.end())
+            {
+                for (const auto & col : columns_it->second.columns)
+                {
+                    if (seen_column_names.insert(col.name).second)
+                    {
+                        subquery_projection_nodes.push_back(std::make_shared<ColumnNode>(col, current));
+                        projection_columns.push_back(col);
+                    }
+                }
+            }
+
+            for (const auto & child : current->getChildren())
+            {
+                if (child)
+                    nodes_to_visit.push(child);
+            }
+        }
+
+        if (subquery_projection_nodes.empty())
+        {
+            auto constant_data_type = std::make_shared<DataTypeUInt64>();
+            subquery_projection_nodes.push_back(std::make_shared<ConstantNode>(1UL, constant_data_type));
+            projection_columns.push_back({"1", std::move(constant_data_type)});
+        }
+
+        auto context_copy = Context::createCopy(context);
+        updateContextForSubqueryExecution(context_copy);
+
+        auto query_node = std::make_shared<QueryNode>(std::move(context_copy));
+        query_node->getProjection().getNodes() = std::move(subquery_projection_nodes);
+        query_node->resolveProjectionColumns(std::move(projection_columns));
+        query_node->getJoinTree() = join_table_expression;
+        query_node->setIsSubquery(true);
+
+        subquery_node = query_node;
     }
     else
     {
