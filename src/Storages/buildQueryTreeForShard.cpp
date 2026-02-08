@@ -602,6 +602,35 @@ QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_contex
                 global_in_or_join_node.subquery_depth);
             temporary_table_expression_node->setAlias(join_table_expression->getAlias());
 
+            /// When the table expression being replaced is an ARRAY_JOIN (or another compound node),
+            /// `cloneAndReplace` will not recurse into its children. This means inner column sources
+            /// (like the TABLE node inside the ARRAY_JOIN) won't be added to the old-to-new pointer map.
+            /// ColumnNodes in the outer query that reference these inner sources via weak_ptr would
+            /// become dangling after the old tree is dropped. To prevent this, add all inner column
+            /// sources to the replacement map so their weak pointers get properly remapped.
+            if (auto * array_join_node = join_table_expression->as<ArrayJoinNode>())
+            {
+                std::stack<QueryTreeNodePtr> inner_sources;
+                inner_sources.push(array_join_node->getTableExpression());
+                while (!inner_sources.empty())
+                {
+                    auto current = inner_sources.top();
+                    inner_sources.pop();
+
+                    replacement_map.emplace(current.get(), temporary_table_expression_node);
+
+                    if (auto * inner_join = current->as<JoinNode>())
+                    {
+                        inner_sources.push(inner_join->getLeftTableExpression());
+                        inner_sources.push(inner_join->getRightTableExpression());
+                    }
+                    else if (auto * inner_array_join = current->as<ArrayJoinNode>())
+                    {
+                        inner_sources.push(inner_array_join->getTableExpression());
+                    }
+                }
+            }
+
             replacement_map.emplace(join_table_expression.get(), std::move(temporary_table_expression_node));
             continue;
         }
