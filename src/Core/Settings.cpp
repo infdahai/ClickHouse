@@ -274,7 +274,9 @@ For queries that are completed quickly because of a LIMIT, you can set a lower '
 For example, if the necessary number of entries are located in every block and max_threads = 8, then 8 blocks are retrieved, although it would have been enough to read just one.
 The smaller the `max_threads` value, the less memory is consumed.
 
-The `max_threads` setting by default matches the number of hardware threads available to ClickHouse.
+The `max_threads` setting by default matches the number of hardware threads (number of CPU cores) available to ClickHouse.
+As a special case, for x86 processors with less than 32 CPU cores and SMT (e.g. Intel HyperThreading), ClickHouse uses the number of logical cores (= 2 x physical core count) by default.
+
 Without SMT (e.g. Intel HyperThreading), this corresponds to the number of CPU cores.
 
 For ClickHouse Cloud users, the default value will display as `auto(N)` where N matches the vCPU size of your service e.g. 2vCPU/8GiB, 4vCPU/16GiB etc.
@@ -7514,9 +7516,9 @@ DECLARE(Bool, allow_experimental_ytsaurus_dictionary_source, false, R"(
     DECLARE(Bool, distributed_plan_force_shuffle_aggregation, false, R"(
 Use Shuffle aggregation strategy instead of PartialAggregation + Merge in distributed query plan.
 )", EXPERIMENTAL) \
-    DECLARE(Bool, enable_join_runtime_filters, false, R"(
+    DECLARE(Bool, enable_join_runtime_filters, true, R"(
 Filter left side by set of JOIN keys collected from the right side at runtime.
-)", EXPERIMENTAL) \
+)", BETA) \
     DECLARE(UInt64, join_runtime_filter_exact_values_limit, 10000, R"(
 Maximum number of elements in runtime filter that are stored as is in a set, when this threshold is exceeded if switches to bloom filter.
 )", EXPERIMENTAL) \

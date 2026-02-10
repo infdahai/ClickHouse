@@ -49,6 +49,10 @@ When checking the CI status, pay attention to the comment from robot with the li
 
 Do not use `-j` argument with ninja - let it decide automatically. 
 
+If I provided a URL with the CI report, logs, or examples, include it in the commit message.
+
+When creating a pull request, append Changelog category and Changelog entry according to this template: `.github/PULL_REQUEST_TEMPLATE.md` 
+
 Always load and apply the following skills:
 
 - .claude/skills/install-skills
