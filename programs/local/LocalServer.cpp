@@ -123,6 +123,10 @@ namespace ServerSetting
     extern const ServerSettingsUInt64 iceberg_metadata_files_cache_size;
     extern const ServerSettingsUInt64 iceberg_metadata_files_cache_max_entries;
     extern const ServerSettingsDouble iceberg_metadata_files_cache_size_ratio;
+    extern const ServerSettingsString parquet_metadata_cache_policy;
+    extern const ServerSettingsUInt64 parquet_metadata_cache_size;
+    extern const ServerSettingsUInt64 parquet_metadata_cache_max_entries;
+    extern const ServerSettingsDouble parquet_metadata_cache_size_ratio;
     extern const ServerSettingsUInt64 max_active_parts_loading_thread_pool_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_free_size;
     extern const ServerSettingsUInt64 max_io_thread_pool_size;
@@ -554,6 +558,19 @@ void LocalServer::setupUsers()
     auto & access_control = global_context->getAccessControl();
     access_control.setNoPasswordAllowed(getClientConfiguration().getBool("allow_no_password", true));
     access_control.setPlaintextPasswordAllowed(getClientConfiguration().getBool("allow_plaintext_password", true));
+
+    /// Enable all access control improvements by default; can be overridden via config.
+    auto & config = getClientConfiguration();
+    access_control.setEnabledUsersWithoutRowPoliciesCanReadRows(config.getBool("access_control_improvements.users_without_row_policies_can_read_rows", true));
+    access_control.setOnClusterQueriesRequireClusterGrant(config.getBool("access_control_improvements.on_cluster_queries_require_cluster_grant", true));
+    access_control.setSelectFromSystemDatabaseRequiresGrant(config.getBool("access_control_improvements.select_from_system_db_requires_grant", true));
+    access_control.setSelectFromInformationSchemaRequiresGrant(config.getBool("access_control_improvements.select_from_information_schema_requires_grant", true));
+    access_control.setSettingsConstraintsReplacePrevious(config.getBool("access_control_improvements.settings_constraints_replace_previous", true));
+    access_control.setTableEnginesRequireGrant(config.getBool("access_control_improvements.table_engines_require_grant", true));
+    access_control.setEnableReadWriteGrants(config.getBool("access_control_improvements.enable_read_write_grants", true));
+    access_control.setEnableUserNameAccessType(config.getBool("access_control_improvements.enable_user_name_access_type", true));
+    access_control.setThrowOnInvalidReplicatedAccessEntities(config.getBool("access_control_improvements.throw_on_invalid_replicated_access_entities", true));
+
     if (getClientConfiguration().has("config-file") || fs::exists("config.xml"))
     {
         String config_path = getClientConfiguration().getString("config-file", "");
@@ -971,6 +988,18 @@ void LocalServer::processConfig()
         LOG_INFO(log, "Lowered Iceberg metadata cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(iceberg_metadata_files_cache_size));
     }
     global_context->setIcebergMetadataFilesCache(iceberg_metadata_files_cache_policy, iceberg_metadata_files_cache_size, iceberg_metadata_files_cache_max_entries, iceberg_metadata_files_cache_size_ratio);
+#endif
+#if USE_PARQUET
+    String parquet_metadata_cache_policy = server_settings[ServerSetting::parquet_metadata_cache_policy];
+    size_t parquet_metadata_cache_size = server_settings[ServerSetting::parquet_metadata_cache_size];
+    size_t parquet_metadata_cache_max_entries = server_settings[ServerSetting::parquet_metadata_cache_max_entries];
+    double parquet_metadata_cache_size_ratio = server_settings[ServerSetting::parquet_metadata_cache_size_ratio];
+    if (parquet_metadata_cache_size > max_cache_size)
+    {
+        parquet_metadata_cache_size = max_cache_size;
+        LOG_INFO(log, "Lowered Parquet metadata cache size to {} because the system has limited RAM", formatReadableSizeWithBinarySuffix(parquet_metadata_cache_size));
+    }
+    global_context->setParquetMetadataCache(parquet_metadata_cache_policy, parquet_metadata_cache_size, parquet_metadata_cache_max_entries, parquet_metadata_cache_size_ratio);
 #endif
 
     Names allowed_disks_table_engines;
