@@ -1,6 +1,5 @@
 #include <Storages/buildQueryTreeForShard.h>
 
-#include <Analyzer/ArrayJoinNode.h>
 #include <Analyzer/ConstantNode.h>
 #include <Analyzer/ColumnNode.h>
 #include <Analyzer/createUniqueAliasesIfNecessary.h>
@@ -495,18 +494,18 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
     }
     else if (join_table_expression_node_type == QueryTreeNodeType::ARRAY_JOIN)
     {
-        /// For ARRAY JOIN nodes, collect columns from all column sources in the subtree
-        /// (the ARRAY JOIN itself and its inner table expression), preserving correct column sources.
+        /// ARRAY_JOIN columns have multiple sources: the ARRAY_JOIN itself provides
+        /// the array-joined columns, while the inner table provides pass-through columns.
+        /// We must preserve per-source attribution for correct resolution.
         QueryTreeNodes subquery_projection_nodes;
         NamesAndTypes projection_columns;
         NameSet seen_column_names;
 
-        std::stack<QueryTreeNodePtr> nodes_to_visit;
-        nodes_to_visit.push(join_table_expression);
+        std::vector<QueryTreeNodePtr> nodes_to_visit = {join_table_expression};
         while (!nodes_to_visit.empty())
         {
-            auto current = nodes_to_visit.top();
-            nodes_to_visit.pop();
+            auto current = nodes_to_visit.back();
+            nodes_to_visit.pop_back();
 
             auto columns_it = column_source_to_columns.find(current);
             if (columns_it != column_source_to_columns.end())
@@ -522,10 +521,8 @@ QueryTreeNodePtr getSubqueryFromTableExpression(
             }
 
             for (const auto & child : current->getChildren())
-            {
                 if (child)
-                    nodes_to_visit.push(child);
-            }
+                    nodes_to_visit.push_back(child);
         }
 
         if (subquery_projection_nodes.empty())
@@ -601,35 +598,6 @@ QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_contex
                 planner_context->getMutableQueryContext(),
                 global_in_or_join_node.subquery_depth);
             temporary_table_expression_node->setAlias(join_table_expression->getAlias());
-
-            /// When the table expression being replaced is an ARRAY_JOIN (or another compound node),
-            /// `cloneAndReplace` will not recurse into its children. This means inner column sources
-            /// (like the TABLE node inside the ARRAY_JOIN) won't be added to the old-to-new pointer map.
-            /// ColumnNodes in the outer query that reference these inner sources via weak_ptr would
-            /// become dangling after the old tree is dropped. To prevent this, add all inner column
-            /// sources to the replacement map so their weak pointers get properly remapped.
-            if (auto * array_join_node = join_table_expression->as<ArrayJoinNode>())
-            {
-                std::stack<QueryTreeNodePtr> inner_sources;
-                inner_sources.push(array_join_node->getTableExpression());
-                while (!inner_sources.empty())
-                {
-                    auto current = inner_sources.top();
-                    inner_sources.pop();
-
-                    replacement_map.emplace(current.get(), temporary_table_expression_node);
-
-                    if (auto * inner_join = current->as<JoinNode>())
-                    {
-                        inner_sources.push(inner_join->getLeftTableExpression());
-                        inner_sources.push(inner_join->getRightTableExpression());
-                    }
-                    else if (auto * inner_array_join = current->as<ArrayJoinNode>())
-                    {
-                        inner_sources.push(inner_array_join->getTableExpression());
-                    }
-                }
-            }
 
             replacement_map.emplace(join_table_expression.get(), std::move(temporary_table_expression_node));
             continue;

@@ -277,7 +277,30 @@ QueryTreeNodePtr IQueryTreeNode::cloneAndReplace(const ReplacementMap & replacem
         old_pointer_to_new_pointer.emplace(node_to_clone, node_clone);
 
         if (it != replacement_map.end())
+        {
+            /** When a node is replaced, its children are not traversed.
+              * Map all descendants of the replaced node to the replacement,
+              * so that weak pointers referencing any descendant get updated.
+              */
+            std::vector<const IQueryTreeNode *> descendants_to_map;
+            for (const auto & child : node_to_clone->children)
+                if (child)
+                    descendants_to_map.push_back(child.get());
+
+            while (!descendants_to_map.empty())
+            {
+                const auto * descendant = descendants_to_map.back();
+                descendants_to_map.pop_back();
+
+                old_pointer_to_new_pointer.emplace(descendant, node_clone);
+
+                for (const auto & child : descendant->children)
+                    if (child)
+                        descendants_to_map.push_back(child.get());
+            }
+
             continue;
+        }
 
         node_clone->original_ast = node_to_clone->original_ast;
         node_clone->setAlias(node_to_clone->alias);
@@ -297,15 +320,6 @@ QueryTreeNodePtr IQueryTreeNode::cloneAndReplace(const ReplacementMap & replacem
             weak_pointers_to_update_after_clone.push_back(&weak_pointer);
         }
     }
-
-    /** Ensure all replacement_map entries are in old_pointer_to_new_pointer.
-      * When a node is replaced, its children are not traversed and thus not added
-      * to old_pointer_to_new_pointer. If those children are also in the replacement_map
-      * (e.g., inner column sources of an ARRAY_JOIN being replaced), their entries
-      * must be available for weak pointer updates below.
-      */
-    for (const auto & [old_ptr, new_ptr] : replacement_map)
-        old_pointer_to_new_pointer.emplace(old_ptr, new_ptr);
 
     /** Update weak pointers to new pointers if they were changed during clone.
       * To do this we check old pointer to new pointer map, if weak pointer
