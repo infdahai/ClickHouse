@@ -599,6 +599,29 @@ QueryTreeNodePtr buildQueryTreeForShard(const PlannerContextPtr & planner_contex
                 global_in_or_join_node.subquery_depth);
             temporary_table_expression_node->setAlias(join_table_expression->getAlias());
 
+            /** When a compound node like ARRAY_JOIN is replaced, its descendants (e.g., the inner TABLE)
+              * are not traversed by cloneAndReplace. Column nodes that reference these descendants
+              * as their source would get dangling weak pointers when the original tree is released.
+              * Map all descendants of the replaced node to the temporary table so that
+              * weak pointer updates in cloneAndReplace can find them.
+              */
+            std::vector<const IQueryTreeNode *> descendants_to_map;
+            for (const auto & child : join_table_expression->getChildren())
+                if (child)
+                    descendants_to_map.push_back(child.get());
+
+            while (!descendants_to_map.empty())
+            {
+                const auto * descendant = descendants_to_map.back();
+                descendants_to_map.pop_back();
+
+                replacement_map.emplace(descendant, temporary_table_expression_node);
+
+                for (const auto & child : descendant->getChildren())
+                    if (child)
+                        descendants_to_map.push_back(child.get());
+            }
+
             replacement_map.emplace(join_table_expression.get(), std::move(temporary_table_expression_node));
             continue;
         }
