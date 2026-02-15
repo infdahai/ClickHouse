@@ -5,14 +5,36 @@ import time
 from pathlib import Path
 from typing import List, Tuple
 
+from more_itertools import tail
+
 from ci.jobs.scripts.find_tests import Targeting
 from ci.jobs.scripts.integration_tests_configs import IMAGES_ENV, get_optimal_test_batch
 from ci.praktika.info import Info
-from ci.praktika.result import Result
-from ci.praktika.utils import Shell, Utils
+from ci.praktika.result import Result, ResultTranslator
+from ci.praktika.utils import ContextManager, Shell, Utils
 
 repo_dir = Utils.cwd()
 temp_path = f"{repo_dir}/ci/tmp"
+
+BUGFIX_BUILD_TYPES = ["amd_asan", "amd_tsan", "amd_msan", "amd_ubsan", "amd_debug"]
+
+
+def find_master_builds():
+    """Find S3 URLs for all 5 build types from a recent master commit."""
+    raw = Shell.get_output(
+        "git log origin/master --format=%H -n 50", verbose=True
+    )
+    commits = raw.strip().splitlines()
+    for sha in commits:
+        probe_url = f"https://clickhouse-builds.s3.us-east-1.amazonaws.com/REFs/master/{sha}/build_{BUGFIX_BUILD_TYPES[0]}/clickhouse"
+        if Shell.check(f"curl -sfI {probe_url} > /dev/null"):
+            return {
+                bt: f"https://clickhouse-builds.s3.us-east-1.amazonaws.com/REFs/master/{sha}/build_{bt}/clickhouse"
+                for bt in BUGFIX_BUILD_TYPES
+            }
+    return None
+
+
 MAX_FAILS_BEFORE_DROP = 5
 OOM_IN_DMESG_TEST_NAME = "OOM in dmesg"
 ncpu = Utils.cpu_count()
@@ -78,6 +100,12 @@ def parse_args():
     parser.add_argument(
         "--workers",
         help="Optional. Number of parallel workers for pytest",
+        default=None,
+        type=int,
+    )
+    parser.add_argument(
+        "--session-timeout",
+        help="Optional. Session timeout in seconds",
         default=None,
         type=int,
     )
@@ -223,6 +251,43 @@ def get_parallel_sequential_tests_to_run(
     return parallel_tests, sequential_tests
 
 
+def tail(filepath: str, buff_len: int = 1024) -> List[str]:
+    with open(filepath, "rb") as f:
+        f.seek(-buff_len, os.SEEK_END)
+        f.readline()
+        data = f.read()
+        return data.decode(errors="replace")
+
+
+def run_pytest_and_collect_results(command: str, env: str, report_name: str) -> Result:
+    """
+    Does xdist timeout check.
+    """
+
+    test_result = Result.from_pytest_run(
+        command=command,
+        env=env,
+        cwd="./tests/integration/",
+        pytest_report_file=f"{temp_path}/pytest_{report_name}.jsonl",
+        pytest_logfile=f"{temp_path}/pytest_{report_name}.log",
+        logfile=f"{temp_path}/{report_name}.log",
+    )
+
+    if "!!!!!!! xdist.dsession.Interrupted: session-timeout:" in tail(
+        f"{temp_path}/{report_name}.log"
+    ):
+        test_result.info = "[ERROR] session-timeout occurred during test execution"
+        assert test_result.status == Result.Status.ERROR
+        test_result.results.append(
+            Result(
+                name="Timeout",
+                status=Result.StatusExtended.FAIL,
+                info=test_result.info,
+            )
+        )
+    return test_result
+
+
 def main():
     sw = Utils.Stopwatch()
     info = Info()
@@ -364,21 +429,17 @@ tar -czf ./ci/tmp/logs.tar.gz \
                     changed_test_modules.append(file.removeprefix("tests/integration/"))
 
     if is_bugfix_validation:
-        if Utils.is_arm():
-            link_to_master_head_binary = "https://clickhouse-builds.s3.us-east-1.amazonaws.com/master/aarch64/clickhouse"
-        else:
-            link_to_master_head_binary = "https://clickhouse-builds.s3.us-east-1.amazonaws.com/master/amd64/clickhouse"
-        if not info.is_local_run or not (Path(temp_path) / "clickhouse").exists():
-            print(
-                f"NOTE: Clickhouse binary will be downloaded to [{temp_path}] from [{link_to_master_head_binary}]"
-            )
-            if info.is_local_run:
-                time.sleep(10)
-            Shell.check(
-                f"wget -nv -P {temp_path} {link_to_master_head_binary}",
-                verbose=True,
-                strict=True,
-            )
+        build_urls = find_master_builds()
+        assert build_urls, "Could not find master builds in S3"
+        for bt, url in build_urls.items():
+            bt_path = f"{temp_path}/clickhouse_{bt}"
+            if not info.is_local_run or not Path(bt_path).is_file():
+                print(f"NOTE: Downloading {bt} build to [{bt_path}]")
+                Shell.run(
+                    f"wget -nv -O {bt_path} {url}", verbose=True, strict=True
+                )
+                Shell.run(f"chmod +x {bt_path}", verbose=True)
+        clickhouse_path = f"{temp_path}/clickhouse_{BUGFIX_BUILD_TYPES[0]}"
 
     if is_bugfix_validation or is_flaky_check:
         assert (
@@ -477,19 +538,16 @@ tar -czf ./ci/tmp/logs.tar.gz \
     failed_tests_files = []
 
     has_error = False
-    if not is_targeted_check:
-        session_timeout_parallel = 3600 * 2
-        session_timeout_sequential = 3600
-    else:
-        # For targeted jobs, use a shorter session timeout to keep feedback fast.
-        # If this timeout is exceeded but all completed tests have passed, the
-        # targeted check will not fail solely because the session timed out.
-        session_timeout_parallel = 1200
-        session_timeout_sequential = 1200
+    session_timeout_parallel = 3600 * 2
+    session_timeout_sequential = 3600
 
     if is_llvm_coverage:
         session_timeout_parallel = 7200
         session_timeout_sequential = 7200
+
+    if args.session_timeout:
+        session_timeout_parallel = args.session_timeout * 2
+        session_timeout_sequential = args.session_timeout
 
     error_info = []
 
@@ -502,12 +560,10 @@ tar -czf ./ci/tmp/logs.tar.gz \
     if parallel_test_modules:
         for attempt in range(module_repeat_cnt):
             log_file = f"{temp_path}/pytest_parallel.log"
-            test_result_parallel = Result.from_pytest_run(
+            test_result_parallel = run_pytest_and_collect_results(
                 command=f"{' '.join(parallel_test_modules)} --report-log-exclude-logs-on-passed-tests -n {workers} --dist=loadfile --tb=short {repeat_option} --session-timeout={session_timeout_parallel}",
-                cwd="./tests/integration/",
                 env=test_env,
-                pytest_report_file=f"{temp_path}/pytest_parallel.jsonl",
-                logfile=log_file,
+                report_name="parallel",
             )
             if is_flaky_check and not test_result_parallel.is_ok():
                 print(
@@ -532,14 +588,12 @@ tar -czf ./ci/tmp/logs.tar.gz \
     fail_num = len([r for r in test_results if not r.is_ok()])
     if sequential_test_modules and fail_num < MAX_FAILS_BEFORE_DROP and not has_error:
         for attempt in range(module_repeat_cnt):
-            log_file = f"{temp_path}/pytest_sequential.log"
-            test_result_sequential = Result.from_pytest_run(
+            test_result_sequential = run_pytest_and_collect_results(
                 command=f"{' '.join(sequential_test_modules)} --report-log-exclude-logs-on-passed-tests --tb=short {repeat_option} -n 1 --dist=loadfile --session-timeout={session_timeout_sequential}",
                 env=test_env,
-                cwd="./tests/integration/",
-                pytest_report_file=f"{temp_path}/pytest_sequential.jsonl",
-                logfile=log_file,
+                report_name="sequential",
             )
+
             if is_flaky_check and not test_result_sequential.is_ok():
                 print(
                     f"Flaky check: Test run fails after attempt [{attempt+1}/{module_repeat_cnt}] - break"
@@ -559,6 +613,51 @@ tar -czf ./ci/tmp/logs.tar.gz \
                 # failures and avoid setting the error flag for targeted runs.
                 has_error = True
                 error_info.append(test_result_sequential.info)
+
+    # Run additional build types for bugfix validation
+    if is_bugfix_validation:
+        for r in test_results:
+            r.set_label(BUGFIX_BUILD_TYPES[0])
+        all_bugfix_test_results = list(test_results)
+
+        for bugfix_bt in BUGFIX_BUILD_TYPES[1:]:
+            print(f"\n=== Bugfix validation with {bugfix_bt} ===")
+            bt_clickhouse_path = f"{temp_path}/clickhouse_{bugfix_bt}"
+            test_env["CLICKHOUSE_TESTS_SERVER_BIN_PATH"] = bt_clickhouse_path
+            test_env["CLICKHOUSE_BINARY"] = bt_clickhouse_path
+            test_env["CLICKHOUSE_TESTS_CLIENT_BIN_PATH"] = bt_clickhouse_path
+            Shell.check(
+                f"{bt_clickhouse_path} --version", verbose=True, strict=True
+            )
+
+            bt_test_results = []
+
+            if parallel_test_modules:
+                bt_result_parallel = run_pytest_and_collect_results(
+                    command=f"{' '.join(parallel_test_modules)} --report-log-exclude-logs-on-passed-tests -n {workers} --dist=loadfile --tb=short {repeat_option} --session-timeout={session_timeout_parallel}",
+                    env=test_env,
+                    report_name=f"parallel_{bugfix_bt}",
+                )
+                bt_test_results.extend(bt_result_parallel.results)
+                if bt_result_parallel.files:
+                    failed_tests_files.extend(bt_result_parallel.files)
+
+            bt_fail_num = len([r for r in bt_test_results if not r.is_ok()])
+            if sequential_test_modules and bt_fail_num < MAX_FAILS_BEFORE_DROP:
+                bt_result_sequential = run_pytest_and_collect_results(
+                    command=f"{' '.join(sequential_test_modules)} --report-log-exclude-logs-on-passed-tests --tb=short {repeat_option} -n 1 --dist=loadfile --session-timeout={session_timeout_sequential}",
+                    env=test_env,
+                    report_name=f"sequential_{bugfix_bt}",
+                )
+                bt_test_results.extend(bt_result_sequential.results)
+                if bt_result_sequential.files:
+                    failed_tests_files.extend(bt_result_sequential.files)
+
+            for r in bt_test_results:
+                r.set_label(bugfix_bt)
+            all_bugfix_test_results.extend(bt_test_results)
+
+        test_results = all_bugfix_test_results
 
     # Collect logs before re-run
     attached_files = []
@@ -596,11 +695,10 @@ tar -czf ./ci/tmp/logs.tar.gz \
     if 0 < len(failed_test_cases) < 10 and not (
         is_flaky_check or is_bugfix_validation or is_targeted_check or info.is_local_run
     ):
-        test_result_retries = Result.from_pytest_run(
+        test_result_retries = run_pytest_and_collect_results(
             command=f"{' '.join(failed_test_cases)} --report-log-exclude-logs-on-passed-tests --tb=short -n 1 --dist=loadfile --session-timeout=1200",
             env=test_env,
-            cwd="./tests/integration/",
-            pytest_report_file=f"{temp_path}/pytest_retries.jsonl",
+            report_name="retries",
         )
         successful_retries = [t.name for t in test_result_retries.results if t.is_ok()]
         failed_retries = [t.name for t in test_result_retries.results if t.is_failure()]
@@ -630,6 +728,11 @@ tar -czf ./ci/tmp/logs.tar.gz \
                     )
                 )
                 attached_files.append("./ci/tmp/dmesg.log")
+
+    # For targeted checks, session-timeout is an expected risk (because of --count N
+    # overloading), so do not propagate the synthetic "Timeout" result as a failure.
+    if is_targeted_check:
+        test_results = [r for r in test_results if r.name != "Timeout"]
 
     R = Result.create_from(results=test_results, stopwatch=sw, files=attached_files)
 
